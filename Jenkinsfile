@@ -1,174 +1,71 @@
 pipeline {
-  agent any
-
-  environment {
-    // ===== Docker Hub target =====
-    IMAGE_NAME = "premoli126/node-app"
-    IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
-
-    // ===== DinD over TLS (matches your compose) =====
-    DOCKER_HOST       = 'tcp://dind:2376'
-    DOCKER_TLS_VERIFY = '1'
-    // IMPORTANT: in your Jenkins container the certs are at /certs/client/client/*.pem
-    DOCKER_CERT_PATH  = '/certs/client/client'
+  /* Use Node 16 for the Node steps, like in your file */
+  agent {
+    docker {
+      image 'node:16'
+      args '-u root'
+    }
   }
 
-  options {
-    timestamps()
-    buildDiscarder(logRotator(numToKeepStr: '10'))
+  options { timestamps() }
+
+  environment {
+    IMAGE_NAME = 'premoli126/node-app'
+    IMAGE_TAG  = "v${env.BUILD_NUMBER}"
+    // Snyk token from Jenkins credentials (Secret text)
+    SNYK_TOKEN = credentials('snyk-token')
   }
 
   stages {
-
-    stage('Checkout (clean)') {
+    stage('Install Dependencies') {
       steps {
-        cleanWs()
-        checkout scm
+        sh 'npm install --save'
       }
     }
 
-    stage('Verify workspace') {
+    stage('Unit Tests') {
       steps {
-        sh '''#!/usr/bin/env bash
-set -e
-echo "== TOP LEVEL =="; ls -la
-echo "== LOOK FOR package.json (depth 2) =="
-find . -maxdepth 2 -type f -name package.json -print || true
-'''
+        sh 'npm test || echo "no tests defined"'
       }
     }
 
-    stage('Detect APP_DIR & Dockerfile') {
+    stage('Security Scan (Snyk)') {
       steps {
-        sh '''#!/usr/bin/env bash
-set -e
-PKG="$( [ -f package.json ] && echo package.json || find . -maxdepth 2 -type f -name package.json -print -quit )"
-[ -n "$PKG" ] || { echo "ERROR: No package.json found in repo root or one-level subfolders"; exit 1; }
-APP_DIR="$(dirname "$PKG")"; [ "$APP_DIR" = "." ] && APP_DIR="."
-DF=""
-[ -f "$APP_DIR/Dockerfile" ] && DF="$APP_DIR/Dockerfile"
-[ -z "$DF" ] && [ -f Dockerfile ] && DF="Dockerfile"
-echo "APP_DIR=$APP_DIR"     >  .envfile
-echo "DOCKERFILE_PATH=$DF"  >> .envfile
-cat .envfile
-'''
+        sh '''
+          npm install -g snyk --unsafe-perm
+          snyk auth "$SNYK_TOKEN"
+          # Fail build on High/Critical:
+          snyk test --severity-threshold=high
+          # If you need org scoping, uncomment and set your org:
+          snyk test --org=05e95a46-936a-484e-86c9-09a140e4db93 --severity-threshold=high
+        '''
       }
     }
 
-    stage('Docker sanity (TLS 2376)') {
+    /* Build & push needs Docker access (DinD).
+       Run this stage on the Jenkins controller where DOCKER_HOST/Certs are set
+       by your Jenkins container env (from docker-compose). */
+    stage('Build Docker Image') {
+      agent { label '' }  // switch off the Node docker agent for Docker CLI access
+      environment {
+        DOCKER_HOST = 'tcp://dind:2376'
+        DOCKER_CERT_PATH = '/certs/client/client'
+        DOCKER_TLS_VERIFY = '1'
+      }
       steps {
-        sh '''#!/usr/bin/env bash
-set -e
-echo "DOCKER_HOST=$DOCKER_HOST"
-echo "DOCKER_TLS_VERIFY=$DOCKER_TLS_VERIFY"
-echo "DOCKER_CERT_PATH=$DOCKER_CERT_PATH"
-
-# Optional: ping the Docker API directly using client certs
-if command -v curl >/dev/null 2>&1; then
-  echo "Pinging Docker API at https://dind:2376/_ping ..."
-  curl --silent --show-error --fail \
-       --cacert "$DOCKER_CERT_PATH/ca.pem" \
-       --cert   "$DOCKER_CERT_PATH/cert.pem" \
-       --key    "$DOCKER_CERT_PATH/key.pem" \
-       https://dind:2376/_ping | grep -q '^OK$'
-fi
-
-# Verify via docker client
-docker version
-'''
-      }
-    }
-
-    // ---------- Build steps inside ephemeral Node 16 containers ----------
-    stage('Install deps (Node 16)') {
-      steps {
-        sh '''#!/usr/bin/env bash
-set -e
-source .envfile
-CID="$(docker create node:16 bash -lc 'sleep infinity')"
-docker cp "$APP_DIR/." "$CID:/app"
-docker start "$CID" 1>/dev/null
-docker exec -u 0:0 "$CID" bash -lc 'cd /app && node -v && npm -v && (npm ci || npm install)'
-docker rm -f "$CID" 1>/dev/null
-echo "✅ npm install done"
-'''
-      }
-    }
-
-    stage('Unit tests (Node 16)') {
-      steps {
-        sh '''#!/usr/bin/env bash
-set -e
-source .envfile
-CID="$(docker create node:16 bash -lc 'sleep infinity')"
-docker cp "$APP_DIR/." "$CID:/app"
-docker start "$CID" 1>/dev/null
-# If you don't have tests, do not fail the build
-docker exec -u 0:0 "$CID" bash -lc 'cd /app && (npm test || echo "No tests found — continuing")'
-docker rm -f "$CID" 1>/dev/null
-'''
-      }
-      post {
-        always {
-          // harmless if you don't produce junit.xml
-          junit allowEmptyResults: true, testResults: '**/junit.xml'
-        }
-      }
-    }
-
-    // ---------- Security scan (OWASP DC) — fail on High/Critical (CVSS ≥ 7.0) ----------
-    stage('OWASP scan (fail on High/Critical)') {
-      steps {
-        sh '''#!/usr/bin/env bash
-set -e
-source .envfile
-mkdir -p .depcheck
-
-# Run OWASP Dependency-Check with fail gate at CVSS 7.0
-CID="$(docker create owasp/dependency-check:latest \
-  --scan /src \
-  --format XML,HTML \
-  --out /report \
-  --failOnCVSS 7.0)"
-docker cp "$APP_DIR/." "$CID:/src"
-
-set +e
-docker start -a "$CID"
-RC=$?
-set -e
-
-docker cp "$CID:/report/." ".depcheck/" || true
-docker rm -f "$CID" 1>/dev/null || true
-
-exit $RC   # non-zero if High/Critical found
-'''
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: '.depcheck/**', allowEmptyArchive: true, fingerprint: true
-        }
-      }
-    }
-
-    // ---------- Build & Push image ----------
-    stage('Docker build & push') {
-      steps {
-        withCredentials([usernamePassword(
-          credentialsId: 'dockerhub-credentials',   // <--- change if your ID differs
-          usernameVariable: 'DH_USER',
-          passwordVariable: 'DH_PASS'
-        )]) {
-          sh '''#!/usr/bin/env bash
-set -e
-source .envfile
-[ -n "$DOCKERFILE_PATH" ] || { echo "ERROR: No Dockerfile in $APP_DIR or repo root"; exit 1; }
-
-echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
-docker build -f "$DOCKERFILE_PATH" -t "${IMAGE_NAME}:${IMAGE_TAG}" "$APP_DIR"
-docker push "${IMAGE_NAME}:${IMAGE_TAG}"
-docker tag  "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"
-docker push "${IMAGE_NAME}:latest"
-'''
+        script {
+          // Bind Docker Hub username/password properly:
+          withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials',
+                                            usernameVariable: 'DOCKERHUB_USR',
+                                            passwordVariable: 'DOCKERHUB_PSW')]) {
+            sh """
+              docker login -u "$DOCKERHUB_USR" -p "$DOCKERHUB_PSW" docker.io
+              docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+              docker push ${IMAGE_NAME}:${IMAGE_TAG}
+              docker tag  ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+              docker push ${IMAGE_NAME}:latest
+            """
+          }
         }
       }
     }
@@ -176,6 +73,8 @@ docker push "${IMAGE_NAME}:latest"
 
   post {
     always {
+      // keep it simple; archive any test XMLs if they exist
+      archiveArtifacts artifacts: '**/test-results/*.xml', allowEmptyArchive: true
       cleanWs()
     }
   }
