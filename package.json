@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "description": "Sample Node.js (Express) app for AWS Elastic Beanstalk",
   "main": "app.js",
-  "scripts": {
-    "start": "node app.js"
-  },
+ "scripts": {
+  "start": "node app.js",
+  "test": "echo \"No tests configured\" && exit 0"
+},
   "repository": {
     "type": "git",
     "url": "git+https://github.com/premoli1/aws-elastic-beanstalk-express-js-sample.git"
