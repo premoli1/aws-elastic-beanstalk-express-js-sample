@@ -55,7 +55,7 @@ pipeline {
           # Build an env file we source in all later stages
           cat > docker-env.sh <<'EOF'
 # default to TLS on 2376
-export DOCKER_HOST=tcp://dind:2376
+export DOCKER_HOST=tcp://docker:2376
 export DOCKER_TLS_VERIFY=1
 # we'll fill DOCKER_CERT_PATH below
 EOF
