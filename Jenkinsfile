@@ -37,7 +37,7 @@ pipeline {
           # Fail build on High/Critical:
           snyk test --severity-threshold=high
           # If you need org scoping, uncomment and set your org:
-          # snyk test --org=<your-org> --severity-threshold=high
+          snyk test --org=05e95a46-936a-484e-86c9-09a140e4db93 --severity-threshold=high
         '''
       }
     }
