@@ -82,15 +82,7 @@ echo "---- docker-env.sh ----"
 cat docker-env.sh
 echo "-----------------------"
 
-# 4) Sanity: ping API with curl using SNI name 'docker'
-curl --silent --show-error --fail \
-  --resolve docker:2376:$DIND_IP \
-  --cacert "$CERT_DIR/ca.pem" \
-  --cert   "$CERT_DIR/cert.pem" \
-  --key    "$CERT_DIR/key.pem" \
-  https://docker:2376/_ping | grep -q '^OK$' || { echo "TLS API ping failed"; exit 1; }
-
-# 5) Verify via docker client using the same env
+# 4) Verify via docker client using the same env
 . ./docker-env.sh
 docker version
 '''
@@ -141,10 +133,12 @@ set -e
 source .envfile
 mkdir -p .depcheck
 
+# IMPORTANT: pass multiple -f flags, not a comma list
 CID="$(docker create owasp/dependency-check:latest \
+  -f XML -f HTML \
   --scan /src \
-  --format XML,HTML \
   --out /report \
+  --project node-app \
   --failOnCVSS 7.0)"
 docker cp "$APP_DIR/." "$CID:/src"
 
@@ -156,10 +150,14 @@ set -e
 docker cp "$CID:/report/." ".depcheck/" || true
 docker rm -f "$CID" 1>/dev/null || true
 
-exit $RC
+exit $RC   # non-zero if High/Critical found
 '''
       }
-      post { always { archiveArtifacts artifacts: '.depcheck/**', allowEmptyArchive: true, fingerprint: true } }
+      post {
+        always {
+          archiveArtifacts artifacts: '.depcheck/**', allowEmptyArchive: true, fingerprint: true
+        }
+      }
     }
 
     // Docker build & push
