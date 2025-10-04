@@ -2,7 +2,6 @@ pipeline {
   agent any
 
   environment {
-    // ===== Docker Hub target =====
     IMAGE_NAME = "premoli126/node-app"
     IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
   }
@@ -46,7 +45,7 @@ cat .envfile
       }
     }
 
-    # Detect cert path, DinD IP, and set Docker TLS env (no compose changes)
+    // Detect cert path, DinD IP, and set Docker TLS env (no compose changes)
     stage('Detect Docker TLS & sanity') {
       steps {
         sh '''#!/usr/bin/env bash
@@ -83,7 +82,7 @@ echo "---- docker-env.sh ----"
 cat docker-env.sh
 echo "-----------------------"
 
-# 4) Sanity: ping API with curl (map 'docker' => $DIND_IP for SNI check)
+# 4) Sanity: ping API with curl using SNI name 'docker'
 curl --silent --show-error --fail \
   --resolve docker:2376:$DIND_IP \
   --cacert "$CERT_DIR/ca.pem" \
@@ -98,7 +97,7 @@ docker version
       }
     }
 
-    // ---------- Build steps inside ephemeral Node 16 containers ----------
+    // Install deps in ephemeral Node 16 container
     stage('Install deps (Node 16)') {
       steps {
         sh '''#!/usr/bin/env bash
@@ -133,7 +132,7 @@ docker rm -f "$CID" 1>/dev/null
       post { always { junit allowEmptyResults: true, testResults: '**/junit.xml' } }
     }
 
-    // ---------- Security scan (OWASP DC) — fail on High/Critical (CVSS ≥ 7.0) ----------
+    // Security scan (OWASP DC) — fail on High/Critical (CVSS ≥ 7.0)
     stage('OWASP scan (fail on High/Critical)') {
       steps {
         sh '''#!/usr/bin/env bash
@@ -157,17 +156,17 @@ set -e
 docker cp "$CID:/report/." ".depcheck/" || true
 docker rm -f "$CID" 1>/dev/null || true
 
-exit $RC   # non-zero if High/Critical found
+exit $RC
 '''
       }
       post { always { archiveArtifacts artifacts: '.depcheck/**', allowEmptyArchive: true, fingerprint: true } }
     }
 
-    // ---------- Build & Push image ----------
+    // Docker build & push
     stage('Docker build & push') {
       steps {
         withCredentials([usernamePassword(
-          credentialsId: 'dockerhub-credentials',   // <-- change if your ID differs
+          credentialsId: 'dockerhub-credentials',   // change if your ID differs
           usernameVariable: 'DH_USER',
           passwordVariable: 'DH_PASS'
         )]) {
