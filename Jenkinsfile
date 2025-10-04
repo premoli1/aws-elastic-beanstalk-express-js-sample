@@ -2,12 +2,14 @@ pipeline {
   agent any
 
   environment {
-    // ===== Docker Hub target =====
+    // ==== Docker Hub target ====
     IMAGE_NAME = "premoli126/node-app"
     IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
 
-    // ===== DinD (non-TLS) =====
-    DOCKER_HOST = 'tcp://dind:2375'
+    // ==== DinD over TLS (matches your docker-compose) ====
+    DOCKER_HOST       = 'tcp://dind:2376'
+    DOCKER_TLS_VERIFY = '1'
+    DOCKER_CERT_PATH  = '/certs/client'
   }
 
   options {
@@ -52,28 +54,32 @@ cat .envfile
       }
     }
 
-    stage('Docker sanity (DinD reachable)') {
+    stage('Docker sanity (TLS 2376)') {
       steps {
         sh '''#!/usr/bin/env bash
 set -e
-# hard-clear any TLS leftovers coming from the container env
-unset DOCKER_TLS_VERIFY DOCKER_CERT_PATH
-export DOCKER_TLS_VERIFY= DOCKER_CERT_PATH=
-echo "DOCKER_HOST=${DOCKER_HOST}"
-echo "DOCKER_TLS_VERIFY=${DOCKER_TLS_VERIFY:-<empty>}"
-echo "DOCKER_CERT_PATH=${DOCKER_CERT_PATH:-<empty>}"
+echo "DOCKER_HOST=$DOCKER_HOST"
+echo "DOCKER_TLS_VERIFY=$DOCKER_TLS_VERIFY"
+echo "DOCKER_CERT_PATH=$DOCKER_CERT_PATH"
+# Optional: quick API ping using curl and client certs
+if command -v curl >/dev/null 2>&1; then
+  echo "Pinging Docker API at https://dind:2376/_ping ..."
+  curl --silent --show-error --fail \
+       --cacert "$DOCKER_CERT_PATH/ca.pem" \
+       --cert   "$DOCKER_CERT_PATH/cert.pem" \
+       --key    "$DOCKER_CERT_PATH/key.pem" \
+       https://dind:2376/_ping | grep -q '^OK$'
+fi
 docker version
 '''
       }
     }
 
-    // --------- Install deps inside an ephemeral Node 16 container ---------
+    // ---------- Build steps inside ephemeral Node 16 containers (safe for TLS DinD) ----------
     stage('Install deps (Node 16)') {
       steps {
         sh '''#!/usr/bin/env bash
 set -e
-unset DOCKER_TLS_VERIFY DOCKER_CERT_PATH
-export DOCKER_TLS_VERIFY= DOCKER_CERT_PATH=
 source .envfile
 CID="$(docker create node:16 bash -lc 'sleep infinity')"
 docker cp "$APP_DIR/." "$CID:/app"
@@ -89,33 +95,32 @@ echo "✅ npm install done"
       steps {
         sh '''#!/usr/bin/env bash
 set -e
-unset DOCKER_TLS_VERIFY DOCKER_CERT_PATH
-export DOCKER_TLS_VERIFY= DOCKER_CERT_PATH=
 source .envfile
 CID="$(docker create node:16 bash -lc 'sleep infinity')"
 docker cp "$APP_DIR/." "$CID:/app"
 docker start "$CID" 1>/dev/null
+# If you don't have tests, don't fail the build
 docker exec -u 0:0 "$CID" bash -lc 'cd /app && (npm test || echo "No tests found — continuing")'
 docker rm -f "$CID" 1>/dev/null
 '''
       }
       post {
         always {
+          // harmless if you don't produce junit.xml
           junit allowEmptyResults: true, testResults: '**/junit.xml'
         }
       }
     }
 
-    // --------- Security scan (OWASP DC) — fail on High/Critical (CVSS ≥ 7.0) ---------
+    // ---------- Security scan (OWASP DC) — fail on High/Critical (CVSS ≥ 7.0) ----------
     stage('OWASP scan (fail on High/Critical)') {
       steps {
         sh '''#!/usr/bin/env bash
 set -e
-unset DOCKER_TLS_VERIFY DOCKER_CERT_PATH
-export DOCKER_TLS_VERIFY= DOCKER_CERT_PATH=
 source .envfile
 mkdir -p .depcheck
 
+# Run OWASP Dependency-Check with fail gate at CVSS 7.0
 CID="$(docker create owasp/dependency-check:latest \
   --scan /src \
   --format XML,HTML \
@@ -141,18 +146,16 @@ exit $RC   # non-zero if High/Critical found
       }
     }
 
-    // --------- Build & Push image ---------
+    // ---------- Build & Push image ----------
     stage('Docker build & push') {
       steps {
         withCredentials([usernamePassword(
-          credentialsId: 'dockerhub-credentials',   // <-- change if your ID differs
+          credentialsId: 'dockerhub-credentials',   // <--- change if your ID differs
           usernameVariable: 'DH_USER',
           passwordVariable: 'DH_PASS'
         )]) {
           sh '''#!/usr/bin/env bash
 set -e
-unset DOCKER_TLS_VERIFY DOCKER_CERT_PATH
-export DOCKER_TLS_VERIFY= DOCKER_CERT_PATH=
 source .envfile
 [ -n "$DOCKERFILE_PATH" ] || { echo "ERROR: No Dockerfile in $APP_DIR or repo root"; exit 1; }
 
