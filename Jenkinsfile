@@ -9,7 +9,7 @@ pipeline {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
         DOCKER_HOST = "tcp://docker:2376"
         DOCKER_TLS_VERIFY = "1"
-        DOCKER_CERT_PATH = "/certs/client"
+        DOCKER_CERT_PATH = "/certs/client/client"
     }
     stages {
         stage('Install System Dependencies') {
