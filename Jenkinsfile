@@ -5,10 +5,10 @@ pipeline {
     IMAGE_NAME = "premoli126/node-app"
     IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
 
-    // Docker Hub creds (Username/Password type)
+    // Docker Hub (Username/Password credentials with ID below)
     DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
 
-    // Optional: Snyk token (Secret text). If you don't have it, the Snyk stage will skip.
+    // Optional Snyk token (Secret text). If not present, Snyk stage skips.
     SNYK_TOKEN = credentials('snyk-token')
   }
 
@@ -47,7 +47,7 @@ if [ ! -f "$CERT_DIR/cert.pem" ] || [ ! -f "$CERT_DIR/key.pem" ] || [ ! -f "$CER
 fi
 echo "Using DOCKER_CERT_PATH=$CERT_DIR"
 
-# Resolve DinD IP (service name is 'dind' in your compose)
+# Resolve DinD IP (compose service name 'dind')
 echo "== Resolve dind =="
 DIND_IP="$(getent hosts dind | awk '{print $1}' | head -n1 || true)"
 if [ -z "$DIND_IP" ]; then
@@ -55,7 +55,7 @@ if [ -z "$DIND_IP" ]; then
   exit 2
 fi
 
-# Write env used by later stages
+# Env for later stages
 cat > docker-env.sh <<EOF
 export DOCKER_HOST=tcp://$DIND_IP:2376
 export DOCKER_TLS_VERIFY=1
@@ -67,7 +67,7 @@ echo "---- docker-env.sh ----"
 cat docker-env.sh
 echo "-----------------------"
 
-# Verify we can talk to the daemon
+# Verify daemon connectivity
 . ./docker-env.sh
 docker version
 '''
@@ -80,7 +80,6 @@ docker version
 set -eu
 . ./docker-env.sh
 
-# Use an ephemeral Node container for npm install
 docker run --rm \
   -e "npm_config_loglevel=warn" \
   -v "$PWD":/app -w /app \
@@ -96,7 +95,6 @@ docker run --rm \
 set -eu
 . ./docker-env.sh
 
-# Run tests if a test script exists; otherwise just print notice
 HAS_TEST="$(node -e "try{console.log(!!require('./package.json').scripts.test)}catch(e){console.log(false)}")"
 if [ "$HAS_TEST" = "true" ]; then
   docker run --rm -v "$PWD":/app -w /app node:20-alpine sh -lc 'npm test'
@@ -107,22 +105,19 @@ fi
       }
       post {
         always {
-          // harmless if you don't create junit.xml
+          // harmless if no reports exist
           junit allowEmptyResults: true, testResults: '**/junit*.xml'
         }
       }
     }
 
     stage('Security Scan (Snyk - optional)') {
-      when {
-        expression { return env.SNYK_TOKEN && env.SNYK_TOKEN.trim() }
-      }
+      when { expression { return env.SNYK_TOKEN && env.SNYK_TOKEN.trim() } }
       steps {
         sh '''#!/bin/sh
 set -eu
 . ./docker-env.sh
 
-# Run Snyk via official CLI image; no local npm global install needed
 docker run --rm \
   -e SNYK_TOKEN="$SNYK_TOKEN" \
   -v "$PWD":/app -w /app \
@@ -156,14 +151,19 @@ docker push "${IMAGE_NAME}:latest"
 '''
       }
     }
-  }
 
-  post {
-    always {
-      // Only runs if we still have a workspace (we do, thanks to agent any)
-      cleanWs()
+    // Final stage so workspace steps run IN an agent context
+    stage('Finalize / Cleanup') {
+      steps {
+        echo 'Finalizing...'
+      }
+      post {
+        always {
+          // If you produce artifacts elsewhere, archive here (inside a stage).
+          // archiveArtifacts artifacts: '.depcheck/**', allowEmptyArchive: true, fingerprint: true
+          cleanWs()
+        }
+      }
     }
-    success { echo 'Pipeline completed successfully!' }
-    failure { echo 'Pipeline failed. Check logs for details.' }
   }
 }
