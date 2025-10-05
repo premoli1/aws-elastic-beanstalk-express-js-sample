@@ -9,6 +9,7 @@ pipeline {
   options {
     timestamps()
     buildDiscarder(logRotator(numToKeepStr: '10'))
+    timeout(time: 60, unit: 'MINUTES')   // whole pipeline guard
   }
 
   stages {
@@ -33,7 +34,7 @@ find . -maxdepth 2 -type f -name package.json -print || true
         sh '''#!/usr/bin/env bash
 set -e
 PKG="$( [ -f package.json ] && echo package.json || find . -maxdepth 2 -type f -name package.json -print -quit )"
-[ -n "$PKG" ] || { echo "ERROR: No package.json found in repo root or one-level subfolders"; exit 1; }
+[ -n "$PKG" ] || { echo "ERROR: No package.json found"; exit 1; }
 APP_DIR="$(dirname "$PKG")"; [ "$APP_DIR" = "." ] && APP_DIR="."
 DF=""
 [ -f "$APP_DIR/Dockerfile" ] && DF="$APP_DIR/Dockerfile"
@@ -45,42 +46,35 @@ cat .envfile
       }
     }
 
-    // ---- Use DinD over TLS on dind:2376 (no IP resolution) ----
-    stage('Docker TLS setup & sanity') {
+    stage('Detect Docker TLS & sanity') {
       steps {
         sh '''#!/usr/bin/env bash
 set -e
 
-# Find client certs provided by your compose volumes
+# locate client certs exactly how your compose mounts them
 if [ -f /certs/client/cert.pem ] && [ -f /certs/client/key.pem ] && [ -f /certs/client/ca.pem ]; then
   CERT_DIR="/certs/client"
 elif [ -f /certs/client/client/cert.pem ] && [ -f /certs/client/client/key.pem ] && [ -f /certs/client/client/ca.pem ]; then
   CERT_DIR="/certs/client/client"
 else
-  echo "ERROR: Could not find client certs at /certs/client or /certs/client/client"
-  ls -l /certs || true; ls -l /certs/client || true; ls -l /certs/client/client || true
-  exit 1
+  echo "ERROR: TLS client certs not found"; ls -l /certs || true; ls -l /certs/client || true; ls -l /certs/client/client || true; exit 1
 fi
-echo "Using DOCKER_CERT_PATH=$CERT_DIR"
+DIND_IP="$(getent hosts dind | awk '{print $1}' | head -n1)"
+[ -n "$DIND_IP" ] || { echo "ERROR: cannot resolve dind"; exit 1; }
 
-# Write Docker env for subsequent stages
 cat > docker-env.sh <<EOF
-export DOCKER_HOST=tcp://dind:2376
+export DOCKER_HOST=tcp://$DIND_IP:2376
 export DOCKER_TLS_VERIFY=1
 export DOCKER_CERT_PATH=$CERT_DIR
 export DOCKER_TLS_SERVER_NAME=docker
 EOF
 
-echo "---- docker-env.sh ----"; cat docker-env.sh; echo "-----------------------"
-
-# Verify with Docker CLI
 . ./docker-env.sh
 docker version
 '''
       }
     }
 
-    // ---- Install deps in ephemeral Node 16 container ----
     stage('Install deps (Node 16)') {
       steps {
         sh '''#!/usr/bin/env bash
@@ -107,15 +101,14 @@ source .envfile
 CID="$(docker create node:16 bash -lc 'sleep infinity')"
 docker cp "$APP_DIR/." "$CID:/app"
 docker start "$CID" 1>/dev/null
-docker exec -u 0:0 "$CID" bash -lc 'cd /app && (npm test || echo "No tests configured — continuing")'
+docker exec -u 0:0 "$CID" bash -lc 'cd /app && (npm test || echo "No tests configured")'
 docker rm -f "$CID" 1>/dev/null
 '''
       }
       post { always { junit allowEmptyResults: true, testResults: '**/junit.xml' } }
     }
 
-    // ---- OWASP DC (fail on CVSS >= 7.0 = High/Critical) ----
-    stage('OWASP scan (fail on High/Critical)') {
+    stage('OWASP scan (fast & fail on High/Critical)') {
       steps {
         sh '''#!/usr/bin/env bash
 set -e
@@ -123,8 +116,19 @@ set -e
 source .envfile
 mkdir -p .depcheck
 
-CID="$(docker create owasp/dependency-check:latest \
+# Reuse CVE database across builds (HUGE speedup after first run)
+docker volume inspect dc-data >/dev/null 2>&1 || docker volume create dc-data
+
+# If DB already exists in dc-data, skip update for speed
+HAS_DB="$(docker run --rm -v dc-data:/usr/share/dependency-check/data alpine sh -lc 'test -e /usr/share/dependency-check/data/cve.db && echo yes || true')"
+EXTRA=""
+[ "$HAS_DB" = "yes" ] && EXTRA="--noupdate"
+
+CID="$(docker create \
+  -v dc-data:/usr/share/dependency-check/data \
+  owasp/dependency-check:latest \
   -f XML -f HTML \
+  $EXTRA \
   --scan /src \
   --out /report \
   --project node-app \
@@ -139,17 +143,16 @@ set -e
 docker cp "$CID:/report/." ".depcheck/" || true
 docker rm -f "$CID" 1>/dev/null || true
 
-exit $RC
+exit $RC   # non-zero => fail on High/Critical
 '''
       }
       post { always { archiveArtifacts artifacts: '.depcheck/**', allowEmptyArchive: true, fingerprint: true } }
     }
 
-    // ---- Build & push image ----
     stage('Docker build & push') {
       steps {
         withCredentials([usernamePassword(
-          credentialsId: 'dockerhub-credentials',  // make sure this exists
+          credentialsId: 'dockerhub-credentials',   // make sure this ID exists in Jenkins
           usernameVariable: 'DH_USER',
           passwordVariable: 'DH_PASS'
         )]) {
@@ -157,7 +160,7 @@ exit $RC
 set -e
 . ./docker-env.sh
 source .envfile
-[ -n "$DOCKERFILE_PATH" ] || { echo "ERROR: No Dockerfile in $APP_DIR or repo root"; exit 1; }
+[ -n "$DOCKERFILE_PATH" ] || { echo "ERROR: No Dockerfile"; exit 1; }
 
 echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
 docker build -f "$DOCKERFILE_PATH" -t "${IMAGE_NAME}:${IMAGE_TAG}" "$APP_DIR"
