@@ -2,14 +2,12 @@ pipeline {
   agent any
 
   environment {
+    // ---- image naming ----
     IMAGE_NAME = "premoli126/node-app"
     IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
 
-    // Docker Hub (Username/Password credentials with ID below)
-    DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
-
-    // Optional Snyk token (Secret text). If not present, Snyk stage skips.
-    SNYK_TOKEN = credentials('snyk-token')
+    // ---- optional: Docker Hub creds (create this ID in Jenkins > Credentials) ----
+    // usernamePassword kind with ID: dockerhub-credentials
   }
 
   options {
@@ -19,151 +17,157 @@ pipeline {
 
   stages {
 
-    stage('Checkout Code') {
+    stage('Checkout (clean)') {
       steps {
         cleanWs()
         checkout scm
       }
     }
 
+    stage('Detect app & Dockerfile') {
+      steps {
+        sh '''
+          set -eu
+          PKG="$( [ -f package.json ] && echo package.json || find . -maxdepth 2 -type f -name package.json -print -quit )"
+          [ -n "$PKG" ] || { echo "No package.json found"; exit 1; }
+          APP_DIR="$(dirname "$PKG")"; [ "$APP_DIR" = "." ] && APP_DIR="."
+          DF=""
+          [ -f "$APP_DIR/Dockerfile" ] && DF="$APP_DIR/Dockerfile"
+          [ -z "$DF" ] && [ -f Dockerfile ] && DF="Dockerfile"
+          [ -n "$DF" ] || { echo "No Dockerfile found in $APP_DIR or repo root"; exit 1; }
+          printf "APP_DIR=%s\nDOCKERFILE_PATH=%s\n" "$APP_DIR" "$DF" > .envfile
+          cat .envfile
+        '''
+      }
+    }
+
     stage('Detect Docker TLS & IP') {
       steps {
-        sh '''#!/bin/sh
-set -eu
+        sh '''
+          set -eu
 
-echo "== Check cert locations =="
-ls -l /certs || true
-ls -l /certs/client || true
-ls -l /certs/client/client || true
+          echo "== Check cert locations =="
+          ls -l /certs || true
+          ls -l /certs/client || true
+          ls -l /certs/client/client || true
 
-# Find client certs in mounted volume
-CERT_DIR="/certs/client/client"
-if [ ! -f "$CERT_DIR/cert.pem" ] || [ ! -f "$CERT_DIR/key.pem" ] || [ ! -f "$CERT_DIR/ca.pem" ]; then
-  CERT_DIR="/certs/client"
-fi
-if [ ! -f "$CERT_DIR/cert.pem" ] || [ ! -f "$CERT_DIR/key.pem" ] || [ ! -f "$CERT_DIR/ca.pem" ]; then
-  echo "ERROR: Could not find Docker client certs at /certs/client or /certs/client/client"
-  exit 2
-fi
-echo "Using DOCKER_CERT_PATH=$CERT_DIR"
+          # 1) pick the client cert dir (your compose usually makes /certs/client/client)
+          if [ -f /certs/client/cert.pem ] && [ -f /certs/client/key.pem ] && [ -f /certs/client/ca.pem ]; then
+            CERT_DIR="/certs/client"
+          elif [ -f /certs/client/client/cert.pem ] && [ -f /certs/client/client/key.pem ] && [ -f /certs/client/client/ca.pem ]; then
+            CERT_DIR="/certs/client/client"
+          else
+            echo "ERROR: Docker client certs not found under /certs/client[/client]"
+            exit 1
+          fi
+          echo "Using DOCKER_CERT_PATH=$CERT_DIR"
 
-# Resolve DinD IP (compose service name 'dind')
-echo "== Resolve dind =="
-DIND_IP="$(getent hosts dind | awk '{print $1}' | head -n1 || true)"
-if [ -z "$DIND_IP" ]; then
-  echo "ERROR: Could not resolve IP for 'dind' on the 'ci' network."
-  exit 2
-fi
+          echo "== Resolve dind =="
+          # If your Jenkins and dind are on a user-defined network, resolve by name:
+          DIND_IP="$(getent hosts dind | awk '{print $1}' | head -n1 || true)"
+          if [ -z "$DIND_IP" ]; then
+            # Fallback: host networking may not resolve 'dind'—try host env if present
+            DIND_IP="dind"
+          fi
 
-# Env for later stages
-cat > docker-env.sh <<EOF
+          # Use SNI name "docker" to match default cert SANs; connect by IP/host separately
+          cat > docker-env.sh <<EOF
 export DOCKER_HOST=tcp://$DIND_IP:2376
 export DOCKER_TLS_VERIFY=1
 export DOCKER_CERT_PATH=$CERT_DIR
 export DOCKER_TLS_SERVER_NAME=docker
 EOF
 
-echo "---- docker-env.sh ----"
-cat docker-env.sh
-echo "-----------------------"
+          echo "---- docker-env.sh ----"
+          cat docker-env.sh
+          echo "-----------------------"
 
-# Verify daemon connectivity
-. ./docker-env.sh
-docker version
-'''
+          # Quick sanity: docker client talks to daemon (requires docker CLI installed in Jenkins)
+          . ./docker-env.sh
+          docker version
+        '''
       }
     }
 
-    stage('Install Node Modules') {
+    stage('Install Node modules (Dockerized)') {
       steps {
-        sh '''#!/bin/sh
-set -eu
-. ./docker-env.sh
+        sh '''
+          set -eu
+          . ./docker-env.sh
+          source .envfile
 
-docker run --rm \
-  -e "npm_config_loglevel=warn" \
-  -v "$PWD":/app -w /app \
-  node:20-alpine \
-  sh -lc 'node -v && npm -v && (npm ci || npm install)'
-'''
+          # Use Node in a container; bind-mount the workspace
+          docker run --rm \
+            -v "$PWD":/app -w /app \
+            node:20-alpine sh -lc "node -v && npm -v && (npm ci || npm install)"
+          echo "✅ npm install done"
+        '''
       }
     }
 
-    stage('Run Unit Tests') {
+    stage('Unit tests (Dockerized)') {
       steps {
-        sh '''#!/bin/sh
-set -eu
-. ./docker-env.sh
-
-HAS_TEST="$(node -e "try{console.log(!!require('./package.json').scripts.test)}catch(e){console.log(false)}")"
-if [ "$HAS_TEST" = "true" ]; then
-  docker run --rm -v "$PWD":/app -w /app node:20-alpine sh -lc 'npm test'
-else
-  echo "No test script defined. Skipping tests."
-fi
-'''
+        sh '''
+          set -eu
+          . ./docker-env.sh
+          # Detect "scripts.test" using grep (no need for host Node)
+          if grep -q '"test"[[:space:]]*:' package.json; then
+            echo "Running tests…"
+            docker run --rm \
+              -v "$PWD":/app -w /app \
+              node:20-alpine sh -lc "npm test"
+          else
+            echo "No test script defined. Skipping tests."
+          fi
+        '''
       }
       post {
         always {
-          // harmless if no reports exist
-          junit allowEmptyResults: true, testResults: '**/junit*.xml'
+          // If you later generate junit.xml, this will pick it up.
+          junit allowEmptyResults: true, testResults: '**/junit.xml'
         }
       }
     }
 
-    stage('Security Scan (Snyk - optional)') {
-      when { expression { return env.SNYK_TOKEN && env.SNYK_TOKEN.trim() } }
+    stage('Quick security check (npm audit)') {
       steps {
-        sh '''#!/bin/sh
-set -eu
-. ./docker-env.sh
-
-docker run --rm \
-  -e SNYK_TOKEN="$SNYK_TOKEN" \
-  -v "$PWD":/app -w /app \
-  snyk/snyk-cli:stable \
-  snyk test --org=premoli1 --severity-threshold=high || true
-'''
+        sh '''
+          set -eu
+          . ./docker-env.sh
+          # Fast, lightweight check. Does not fail the build by default.
+          docker run --rm \
+            -v "$PWD":/app -w /app \
+            node:20-alpine sh -lc "npm audit --audit-level=high || true"
+        '''
       }
     }
 
-    stage('Build Docker Image') {
+    stage('Docker build & push') {
       steps {
-        sh '''#!/bin/sh
-set -eu
-. ./docker-env.sh
+        withCredentials([usernamePassword(
+          credentialsId: 'dockerhub-credentials',  // make sure this ID exists in Jenkins
+          usernameVariable: 'DH_USER',
+          passwordVariable: 'DH_PASS'
+        )]) {
+          sh '''
+            set -eu
+            . ./docker-env.sh
+            source .envfile
 
-docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" .
-docker tag  "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"
-'''
-      }
-    }
-
-    stage('Push to Docker Hub') {
-      steps {
-        sh '''#!/bin/sh
-set -eu
-. ./docker-env.sh
-
-echo "$DOCKERHUB_CREDENTIALS_PSW" | docker login -u "$DOCKERHUB_CREDENTIALS_USR" --password-stdin
-docker push "${IMAGE_NAME}:${IMAGE_TAG}"
-docker push "${IMAGE_NAME}:latest"
-'''
-      }
-    }
-
-    // Final stage so workspace steps run IN an agent context
-    stage('Finalize / Cleanup') {
-      steps {
-        echo 'Finalizing...'
-      }
-      post {
-        always {
-          // If you produce artifacts elsewhere, archive here (inside a stage).
-          // archiveArtifacts artifacts: '.depcheck/**', allowEmptyArchive: true, fingerprint: true
-          cleanWs()
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker build -f "$DOCKERFILE_PATH" -t "${IMAGE_NAME}:${IMAGE_TAG}" "$APP_DIR"
+            docker push "${IMAGE_NAME}:${IMAGE_TAG}"
+            docker tag  "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"
+            docker push "${IMAGE_NAME}:latest"
+          '''
         }
       }
+    }
+  }
+
+  post {
+    always {
+      cleanWs()
     }
   }
 }
