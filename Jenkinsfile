@@ -3,18 +3,16 @@ pipeline {
 
     environment {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
-        DOCKER_HOST = "tcp://docker:2376"
-        DOCKER_TLS_VERIFY = "1"
-        DOCKER_CERT_PATH = "/certs/client/"
+        DOCKER_HOST           = "tcp://docker:2376"
+        DOCKER_TLS_VERIFY     = "1"
+        DOCKER_CERT_PATH      = "/certs/client/"
     }
 
     stages {
         stage('Install System Dependencies') {
             steps {
-                sh '''
-                    apt-get update
-                    apt-get install -y git docker.io curl gnupg lsb-release
-                '''
+                // No root on controller: skip apt-get
+                echo 'Skipping apt-get (no root). Using Dockerized tools instead.'
             }
         }
 
@@ -26,27 +24,43 @@ pipeline {
 
         stage('Install Node Modules') {
             steps {
-                sh 'npm install --save'
+                // Run npm inside a Node container
+                sh '''
+                  set -e
+                  docker run --rm \
+                    -v "$PWD":/app -w /app \
+                    node:20-alpine \
+                    sh -lc 'node -v && npm -v && (npm ci || npm install)'
+                '''
             }
         }
 
         stage('Run Unit Tests') {
             steps {
+                // Run tests inside the same Node container
                 sh '''
-                    if npm run | grep -q "test"; then
-                        npm test
-                    else
-                        echo "No test script defined. Skipping tests."
-                    fi
+                  set -e
+                  docker run --rm \
+                    -v "$PWD":/app -w /app \
+                    node:20-alpine \
+                    sh -lc 'if npm run | grep -q "^ *test"; then npm test; else echo "No test script defined. Skipping tests."; fi'
                 '''
             }
         }
 
         stage('Security Scan') {
             steps {
-                sh 'npm install -g snyk'
-                // fixed spacing between --org and --severity-threshold
-                sh 'snyk test --org=premoli1 --severity-threshold=high || true'
+                // Use Snyk’s Docker image; requires a Snyk token credential you already added
+                withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
+                    sh '''
+                      set -e
+                      docker run --rm \
+                        -e SNYK_TOKEN="$SNYK_TOKEN" \
+                        -v "$PWD":/app -w /app \
+                        snyk/snyk:alpine \
+                        snyk test --severity-threshold=high || true
+                    '''
+                }
             }
         }
 
@@ -59,8 +73,8 @@ pipeline {
         stage('Push to Docker Hub') {
             steps {
                 sh '''
-                    echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin
-                    docker push premoli126/node-app:latest
+                  echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin
+                  docker push premoli126/node-app:latest
                 '''
             }
         }
