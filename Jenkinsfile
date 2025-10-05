@@ -1,12 +1,13 @@
 pipeline {
-   agent any
-    }
+    agent any
+
     environment {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
         DOCKER_HOST = "tcp://docker:2376"
         DOCKER_TLS_VERIFY = "1"
         DOCKER_CERT_PATH = "/certs/client/"
     }
+
     stages {
         stage('Install System Dependencies') {
             steps {
@@ -16,16 +17,19 @@ pipeline {
                 '''
             }
         }
+
         stage('Checkout Code') {
             steps {
                 checkout scm
             }
         }
+
         stage('Install Node Modules') {
             steps {
                 sh 'npm install --save'
             }
         }
+
         stage('Run Unit Tests') {
             steps {
                 sh '''
@@ -37,17 +41,21 @@ pipeline {
                 '''
             }
         }
+
         stage('Security Scan') {
             steps {
                 sh 'npm install -g snyk'
-                sh 'snyk test --org=premoli1--severity-threshold=high || true'
+                // fixed spacing between --org and --severity-threshold
+                sh 'snyk test --org=premoli1 --severity-threshold=high || true'
             }
         }
+
         stage('Build Docker Image') {
             steps {
                 sh 'docker build -t premoli126/node-app:latest .'
             }
         }
+
         stage('Push to Docker Hub') {
             steps {
                 sh '''
@@ -57,6 +65,7 @@ pipeline {
             }
         }
     }
+
     post {
         always {
             archiveArtifacts artifacts: '**/test-results/*.xml', allowEmptyArchive: true
@@ -69,4 +78,4 @@ pipeline {
             echo 'Pipeline failed. Check logs for details.'
         }
     }
-
+}
