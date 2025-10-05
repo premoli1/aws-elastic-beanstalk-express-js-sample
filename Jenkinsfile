@@ -44,12 +44,12 @@ pipeline {
         stage('Security Scan') {
             steps {
                 sh 'npm install -g snyk'
-                sh 'snyk test --org=bikash466 --severity-threshold=high || true'
+                sh 'snyk test --org=snyk-token--severity-threshold=high || true'
             }
         }
         stage('Build Docker Image') {
             steps {
-                sh 'docker build -t bikash466/node-app:latest .'
+                sh 'docker build -t premoli126/node-app:latest .'
             }
         }
         stage('Push to Docker Hub') {
