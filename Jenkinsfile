@@ -1,10 +1,6 @@
 pipeline {
-    agent {
-        docker {
-            image 'node:16-bullseye'
-            args '-u root -v /var/run/docker.sock:/var/run/docker.sock'
-        }
-    }
+    agent any
+    
     environment {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
         DOCKER_HOST = "tcp://docker:2376"
@@ -73,4 +69,4 @@ pipeline {
             echo 'Pipeline failed. Check logs for details.'
         }
     }
-}
+
