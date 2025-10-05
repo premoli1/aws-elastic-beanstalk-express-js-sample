@@ -44,7 +44,7 @@ pipeline {
         stage('Security Scan') {
             steps {
                 sh 'npm install -g snyk'
-                sh 'snyk test --org=snyk-token--severity-threshold=high || true'
+                sh 'snyk test --org=05e95a46-936a-484e-86c9-09a140e4db93-severity-threshold=high || true'
             }
         }
         stage('Build Docker Image') {
