@@ -1,5 +1,6 @@
 pipeline {
-  
+   agent any
+    }
     environment {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
         DOCKER_HOST = "tcp://docker:2376"
