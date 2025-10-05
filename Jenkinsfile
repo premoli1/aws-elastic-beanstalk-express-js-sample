@@ -2,7 +2,6 @@ pipeline {
   agent any
 
   environment {
-    // ---- Docker Hub target ----
     IMAGE_NAME = "premoli126/node-app"
     IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
   }
@@ -46,13 +45,13 @@ cat .envfile
       }
     }
 
-    // ---- Detect DinD TLS certs + IP; prepare Docker client env ----
-    stage('Detect Docker TLS & sanity') {
+    // ---- Use DinD over TLS on dind:2376 (no IP resolution) ----
+    stage('Docker TLS setup & sanity') {
       steps {
         sh '''#!/usr/bin/env bash
 set -e
 
-# 1) Find client certs inside Jenkins container
+# Find client certs provided by your compose volumes
 if [ -f /certs/client/cert.pem ] && [ -f /certs/client/key.pem ] && [ -f /certs/client/ca.pem ]; then
   CERT_DIR="/certs/client"
 elif [ -f /certs/client/client/cert.pem ] && [ -f /certs/client/client/key.pem ] && [ -f /certs/client/client/ca.pem ]; then
@@ -64,14 +63,9 @@ else
 fi
 echo "Using DOCKER_CERT_PATH=$CERT_DIR"
 
-# 2) Resolve DinD IP (avoids TLS CN mismatch)
-DIND_IP="$(getent hosts dind | awk '{print $1}' | head -n1)"
-[ -n "$DIND_IP" ] || { echo "ERROR: Could not resolve IP for 'dind'"; exit 1; }
-echo "Detected DinD IP: $DIND_IP"
-
-# 3) Write env file for later stages
+# Write Docker env for subsequent stages
 cat > docker-env.sh <<EOF
-export DOCKER_HOST=tcp://$DIND_IP:2376
+export DOCKER_HOST=tcp://dind:2376
 export DOCKER_TLS_VERIFY=1
 export DOCKER_CERT_PATH=$CERT_DIR
 export DOCKER_TLS_SERVER_NAME=docker
@@ -79,14 +73,14 @@ EOF
 
 echo "---- docker-env.sh ----"; cat docker-env.sh; echo "-----------------------"
 
-# 4) Verify via Docker client
+# Verify with Docker CLI
 . ./docker-env.sh
 docker version
 '''
       }
     }
 
-    // ---- Install deps in ephemeral Node 16 container (no host mounts) ----
+    // ---- Install deps in ephemeral Node 16 container ----
     stage('Install deps (Node 16)') {
       steps {
         sh '''#!/usr/bin/env bash
@@ -110,7 +104,6 @@ echo "✅ npm install done"
 set -e
 . ./docker-env.sh
 source .envfile
-
 CID="$(docker create node:16 bash -lc 'sleep infinity')"
 docker cp "$APP_DIR/." "$CID:/app"
 docker start "$CID" 1>/dev/null
@@ -121,7 +114,7 @@ docker rm -f "$CID" 1>/dev/null
       post { always { junit allowEmptyResults: true, testResults: '**/junit.xml' } }
     }
 
-    // ---- OWASP Dependency-Check (fail gate High/Critical) ----
+    // ---- OWASP DC (fail on CVSS >= 7.0 = High/Critical) ----
     stage('OWASP scan (fail on High/Critical)') {
       steps {
         sh '''#!/usr/bin/env bash
@@ -130,7 +123,6 @@ set -e
 source .envfile
 mkdir -p .depcheck
 
-# Use two -f flags (not comma-separated). Fail on CVSS >= 7.0
 CID="$(docker create owasp/dependency-check:latest \
   -f XML -f HTML \
   --scan /src \
@@ -147,17 +139,17 @@ set -e
 docker cp "$CID:/report/." ".depcheck/" || true
 docker rm -f "$CID" 1>/dev/null || true
 
-exit $RC   # non-zero if High/Critical found
+exit $RC
 '''
       }
       post { always { archiveArtifacts artifacts: '.depcheck/**', allowEmptyArchive: true, fingerprint: true } }
     }
 
-    // ---- Build & Push Docker image to Docker Hub ----
+    // ---- Build & push image ----
     stage('Docker build & push') {
       steps {
         withCredentials([usernamePassword(
-          credentialsId: 'dockerhub-credentials',   // ensure this ID exists
+          credentialsId: 'dockerhub-credentials',  // make sure this exists
           usernameVariable: 'DH_USER',
           passwordVariable: 'DH_PASS'
         )]) {
@@ -178,7 +170,5 @@ docker push "${IMAGE_NAME}:latest"
     }
   }
 
-  post {
-    always { cleanWs() }
-  }
+  post { always { cleanWs() } }
 }
