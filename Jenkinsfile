@@ -2,12 +2,8 @@ pipeline {
   agent any
 
   environment {
-    // ---- image naming ----
     IMAGE_NAME = "premoli126/node-app"
     IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
-
-    // ---- optional: Docker Hub creds (create this ID in Jenkins > Credentials) ----
-    // usernamePassword kind with ID: dockerhub-credentials
   }
 
   options {
@@ -46,31 +42,21 @@ pipeline {
         sh '''
           set -eu
 
-          echo "== Check cert locations =="
-          ls -l /certs || true
-          ls -l /certs/client || true
-          ls -l /certs/client/client || true
-
-          # 1) pick the client cert dir (your compose usually makes /certs/client/client)
+          # Find client certs (compose can mount either layout)
           if [ -f /certs/client/cert.pem ] && [ -f /certs/client/key.pem ] && [ -f /certs/client/ca.pem ]; then
             CERT_DIR="/certs/client"
           elif [ -f /certs/client/client/cert.pem ] && [ -f /certs/client/client/key.pem ] && [ -f /certs/client/client/ca.pem ]; then
             CERT_DIR="/certs/client/client"
           else
             echo "ERROR: Docker client certs not found under /certs/client[/client]"
+            ls -l /certs || true; ls -l /certs/client || true; ls -l /certs/client/client || true
             exit 1
           fi
-          echo "Using DOCKER_CERT_PATH=$CERT_DIR"
 
-          echo "== Resolve dind =="
-          # If your Jenkins and dind are on a user-defined network, resolve by name:
+          # Resolve DinD IP on the user-defined network; fallback to hostname
           DIND_IP="$(getent hosts dind | awk '{print $1}' | head -n1 || true)"
-          if [ -z "$DIND_IP" ]; then
-            # Fallback: host networking may not resolve 'dind'—try host env if present
-            DIND_IP="dind"
-          fi
+          [ -n "$DIND_IP" ] || DIND_IP="dind"
 
-          # Use SNI name "docker" to match default cert SANs; connect by IP/host separately
           cat > docker-env.sh <<EOF
 export DOCKER_HOST=tcp://$DIND_IP:2376
 export DOCKER_TLS_VERIFY=1
@@ -82,7 +68,7 @@ EOF
           cat docker-env.sh
           echo "-----------------------"
 
-          # Quick sanity: docker client talks to daemon (requires docker CLI installed in Jenkins)
+          # Sanity
           . ./docker-env.sh
           docker version
         '''
@@ -94,9 +80,9 @@ EOF
         sh '''
           set -eu
           . ./docker-env.sh
-          source .envfile
+          . ./.envfile
 
-          # Use Node in a container; bind-mount the workspace
+          # Run Node inside a container; bind-mount workspace
           docker run --rm \
             -v "$PWD":/app -w /app \
             node:20-alpine sh -lc "node -v && npm -v && (npm ci || npm install)"
@@ -110,7 +96,7 @@ EOF
         sh '''
           set -eu
           . ./docker-env.sh
-          # Detect "scripts.test" using grep (no need for host Node)
+
           if grep -q '"test"[[:space:]]*:' package.json; then
             echo "Running tests…"
             docker run --rm \
@@ -123,7 +109,6 @@ EOF
       }
       post {
         always {
-          // If you later generate junit.xml, this will pick it up.
           junit allowEmptyResults: true, testResults: '**/junit.xml'
         }
       }
@@ -134,7 +119,6 @@ EOF
         sh '''
           set -eu
           . ./docker-env.sh
-          # Fast, lightweight check. Does not fail the build by default.
           docker run --rm \
             -v "$PWD":/app -w /app \
             node:20-alpine sh -lc "npm audit --audit-level=high || true"
@@ -145,14 +129,14 @@ EOF
     stage('Docker build & push') {
       steps {
         withCredentials([usernamePassword(
-          credentialsId: 'dockerhub-credentials',  // make sure this ID exists in Jenkins
+          credentialsId: 'dockerhub-credentials',
           usernameVariable: 'DH_USER',
           passwordVariable: 'DH_PASS'
         )]) {
           sh '''
             set -eu
             . ./docker-env.sh
-            source .envfile
+            . ./.envfile
 
             echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
             docker build -f "$DOCKERFILE_PATH" -t "${IMAGE_NAME}:${IMAGE_TAG}" "$APP_DIR"
